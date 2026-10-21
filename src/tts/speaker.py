@@ -45,6 +45,16 @@ class Job:
     stop: threading.Event = field(default_factory=threading.Event)
 
 
+class MediaChannelError(RuntimeError):
+    """The reverse media channel #3 is gone or never arrived.
+
+    The receiver tears its reverse TCP channels down some time after playback
+    ends (observed: state=3 notify, then FIN on #3), so a session whose media
+    channel disappeared must be fully re-opened (SetPlaySource + Open) before
+    the next utterance.
+    """
+
+
 class SpeakerSession:
     """One MiPlay control/media session against the L15A."""
 
@@ -57,6 +67,7 @@ class SpeakerSession:
         self.control = None
         self.seq = 14  # V14 bootstrap uses seq<=14 (Open); heartbeats continue after
         self.media_info_sent = False
+        self.media_seen = False  # True once reverse channel #3 has been observed
         self.state = RtpStreamState()
         self.control_alive = threading.Event()
         self._heartbeat_stop = threading.Event()
@@ -204,20 +215,39 @@ class SpeakerSession:
 
     # ----------------------------------------------------------------- media
 
-    def wait_media(self, timeout=15.0):
-        """Block until RTSP PLAY/TIME_OFFSET and reverse channel #3 exist."""
+    def has_media_channel(self):
+        if self.services is None:
+            return False
+        with self.services.connection_lock:
+            return self.services.reverse_sockets.get(3) is not None
+
+    def wait_media(self, timeout=15.0, stop_event=None):
+        """Block until RTSP PLAY/TIME_OFFSET and reverse channel #3 exist.
+
+        Raises MediaChannelError when the channel does not appear in time (the
+        receiver tears reverse channels down after playback ends + idle), or
+        when stop_event fires first.
+        """
         if not self.services.rtsp_ready.wait(timeout):
-            raise TimeoutError("RTSP did not reach PLAY/TIME_OFFSET readiness")
+            raise MediaChannelError("RTSP did not reach PLAY/TIME_OFFSET readiness")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise MediaChannelError("interrupted before media channel")
             if not self.control_alive.is_set():
-                raise RuntimeError("control connection died before media channel")
-            with self.services.connection_lock:
-                sock = self.services.reverse_sockets.get(3)
-            if sock is not None:
-                return sock
+                raise MediaChannelError("control connection died before media channel")
+            if self.has_media_channel():
+                self.media_seen = True
+                return self._media_socket()
             time.sleep(0.05)
-        raise TimeoutError("reverse media channel #3 did not arrive")
+        raise MediaChannelError("reverse media channel #3 did not arrive")
+
+    def _media_socket(self):
+        with self.services.connection_lock:
+            sock = self.services.reverse_sockets.get(3)
+        if sock is None:
+            raise MediaChannelError("media channel #3 disappeared")
+        return sock
 
     def _send_media_info_once(self, text):
         if self.media_info_sent or not self.control:
@@ -244,7 +274,7 @@ class SpeakerSession:
 
     def speak(self, job):
         """Stream one Job's TTS audio to the speaker; blocks until finished."""
-        media_sock = self.wait_media()
+        media_sock = self.wait_media(stop_event=job.stop)
         self._send_media_info_once(job.text)
 
         def counting(frames):
@@ -252,11 +282,18 @@ class SpeakerSession:
                 job.frames += 1
                 yield f
 
-        send_adts_stream(
-            counting(stream_tts_adts(job.text, job.voice, job.rate)),
-            media_sock, job.stop,
-            self.services.first_pcm_ready, self.services.receiver_playing_ready,
-            self.services.time_offset_us, state=self.state)
+        try:
+            send_adts_stream(
+                counting(stream_tts_adts(job.text, job.voice, job.rate,
+                                         stop_event=job.stop)),
+                media_sock, job.stop,
+                self.services.first_pcm_ready, self.services.receiver_playing_ready,
+                self.services.time_offset_us, state=self.state)
+        except ValueError as exc:
+            if not job.stop.is_set():
+                raise
+            # /stop mid-frame leaves a partial ADTS tail; it is discardable.
+            log(f"AUDIO interrupted; discarding partial tail ({exc})")
 
     # ----------------------------------------------------------------- close
 
@@ -341,9 +378,17 @@ class SpeakerService:
                 "enqueued_at": job.enqueued_at, "started_at": job.started_at,
                 "finished_at": job.finished_at}
 
-    def _ensure_session(self):
+    def _ensure_session(self, need_media=False):
         if self.session and self.session.healthy():
-            return self.session
+            if not need_media:
+                return self.session
+            # An established session whose media channel is gone must be
+            # re-opened; a fresh session (media not yet seen) is fine and its
+            # channels are awaited in wait_media().
+            if self.session.media_seen and not self.session.has_media_channel():
+                log("SESSION media channel #3 gone after playback; re-bootstrapping")
+            else:
+                return self.session
         if self.session:
             log("SESSION stale; closing before re-bootstrap")
             self.session.close()
@@ -365,21 +410,31 @@ class SpeakerService:
             self.current = job
             job.status = "playing"
             job.started_at = time.time()
-            try:
-                sess = self._ensure_session()
-                sess.speak(job)
-                job.status = "stopped" if job.stop.is_set() else "done"
-            except Exception as exc:  # noqa: BLE001 - worker must survive
-                log(f"TTS job {job.id} failed: {exc}")
-                job.status = "error"
-                job.error = str(exc)[:300]
-                if self.session:
-                    self.session.close()
-                    self.session = None
-            finally:
-                job.finished_at = time.time()
-                self.current = None
-                log(f"JOB {job.id} -> {job.status} ({job.frames} frames)")
+            for attempt in (1, 2):
+                try:
+                    sess = self._ensure_session(need_media=True)
+                    sess.speak(job)
+                    job.status = "stopped" if job.stop.is_set() else "done"
+                    break
+                except Exception as exc:  # noqa: BLE001 - worker must survive
+                    log(f"TTS job {job.id} attempt {attempt} failed: {exc}")
+                    if self.session:
+                        self.session.close()
+                        self.session = None
+                    if job.stop.is_set():
+                        job.status = "stopped"
+                        break
+                    # Retry once when nothing was sent yet (channel teardown,
+                    # bootstrap race); never replay a half-heard utterance.
+                    if attempt == 1 and job.frames == 0:
+                        log(f"TTS job {job.id} retrying on a fresh session")
+                        continue
+                    job.status = "error"
+                    job.error = str(exc)[:300]
+                    break
+            job.finished_at = time.time()
+            self.current = None
+            log(f"JOB {job.id} -> {job.status} ({job.frames} frames)")
 
     def shutdown(self):
         self.stop_all()

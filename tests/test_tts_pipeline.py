@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 
 from src.media.audio import iter_adts, send_adts_stream, RtpStreamState
 from src.tts import server as tts_server
@@ -119,6 +120,110 @@ class TestSpeakerServiceOffline(unittest.TestCase):
         self.assertFalse(had_current)
         self.assertEqual(job.status, "stopped")
         self.assertEqual(svc.status()["session"], "down")
+
+    def test_worker_retries_once_when_channel_gone_before_any_frame(self):
+        svc = SpeakerService(speaker_host="192.0.2.99")
+        opens = []
+        sent = {"n": 0}
+
+        class FakeSession:
+            def __init__(self, speaker_host=None, bind_ip=None, heartbeat_interval=0):
+                opens.append(self)
+                self.media_seen = True
+                self.calls = 0
+            def open(self):
+                pass
+            def healthy(self):
+                return True
+            def has_media_channel(self):
+                return False  # always torn down -> _ensure_session re-opens
+            def close(self):
+                pass
+            def speak(self, job):
+                self.calls += 1
+                if self.calls == 1 and sent["n"] == 0:
+                    sent["n"] += 1
+                    from src.tts.speaker import MediaChannelError
+                    raise MediaChannelError("reverse media channel #3 did not arrive")
+                job.frames = 5
+
+        import src.tts.speaker as spk
+        with patch.object(spk, "SpeakerSession", FakeSession):
+            svc.start()
+            try:
+                job = svc.submit("重试验证")
+                deadline = time.monotonic() + 5
+                while not job.finished_at and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertEqual(job.status, "done")
+                self.assertEqual(job.frames, 5)
+                self.assertEqual(len(opens), 2)  # initial + retry re-open
+            finally:
+                svc.shutdown()
+
+    def test_worker_no_retry_after_partial_frames(self):
+        from src.tts.speaker import MediaChannelError
+        svc = SpeakerService(speaker_host="192.0.2.99")
+        opens = []
+
+        class FakeSession:
+            def __init__(self, speaker_host=None, bind_ip=None, heartbeat_interval=0):
+                opens.append(self)
+                self.media_seen = True
+            def open(self):
+                pass
+            def healthy(self):
+                return True
+            def has_media_channel(self):
+                return False
+            def close(self):
+                pass
+            def speak(self, job):
+                job.frames = 40  # half an utterance already heard
+                raise MediaChannelError("teardown mid-utterance")
+
+        import src.tts.speaker as spk
+        with patch.object(spk, "SpeakerSession", FakeSession):
+            svc.start()
+            try:
+                job = svc.submit("不重放半句")
+                deadline = time.monotonic() + 5
+                while not job.finished_at and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertEqual(job.status, "error")
+                self.assertEqual(len(opens), 1)  # no second bootstrap
+            finally:
+                svc.shutdown()
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg required")
+class TestEngineRobustness(unittest.TestCase):
+    def test_stop_wakes_blocked_reader(self):
+        from src.tts.engine import stream_tts_adts
+        stop = threading.Event()
+
+        def hang_forever(text, voice, rate, write):
+            time.sleep(30)  # simulates cloud TTS hang; never writes
+
+        with patch("src.tts.engine.pump_edge_tts", hang_forever):
+            gen = stream_tts_adts("x", stop_event=stop, stall_timeout=60)
+            t = threading.Timer(0.6, stop.set)
+            t.start()
+            t0 = time.monotonic()
+            frames = list(gen)  # must return after stop, not hang 30 s
+            elapsed = time.monotonic() - t0
+        self.assertEqual(frames, [])
+        self.assertLess(elapsed, 5)
+
+    def test_stall_watchdog_flushes_and_raises(self):
+        from src.tts.engine import stream_tts_adts
+
+        def hang_forever(text, voice, rate, write):
+            time.sleep(30)
+
+        with patch("src.tts.engine.pump_edge_tts", hang_forever):
+            with self.assertRaisesRegex(RuntimeError, "stalled"):
+                list(stream_tts_adts("x", stall_timeout=1.5))
 
 
 class TestHttpApi(unittest.TestCase):

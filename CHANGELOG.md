@@ -28,5 +28,15 @@
 - 新增 `src/tts/engine.py`：edge-tts 流式 MP3 → FFmpeg（低延迟参数）→ AAC-LC 48 kHz 立体声 ADTS 帧流；实测 12.35 s 语音首帧延迟 1.92 s、总耗时 2.56 s（流式比 0.21）。
 - 新增 `src/tts/speaker.py`：长驻会话管理 —— V14 bootstrap 时序忠实转录、控制连接周期心跳（可配置/可关）、反向媒体通道 #3 复用、会话死亡自动重新 bootstrap、播报队列与抢占 stop。
 - 新增 `src/tts/server.py`：stdlib HTTP API（`POST /tts`、`/stop`、`GET /health`、`/voices`、`/jobs/<id>`，可选 X-Token），供 Agent/curl 调用。
-- 新增 7 项测试（含可选网络链路测试 `MIPLAY_TTS_LIVE=1`），全套 24 项通过。
-- 已知未实机验证项：长驻心跳周期、连续多播报 PTS 重同步、HTTP 服务的自动重建路径——首次实机验证前请保留 V14 基线对照。
+- 新增 11 项测试（含可选网络链路测试 `MIPLAY_TTS_LIVE=1`），全套 28 项通过。
+
+### 2026-10-21 streaming TTS 实机验证（L15A, 固件 1.92.16）
+
+真实音箱上逐项证实：
+
+- 引导 + 播报：`first-audiopcm=1` 与 `state=2` 就绪门控按 V14 语义命中，首句 162 帧 `done`（5.4 s 含引导）。
+- 背靠背会话复用：第二句免引导直接出流（4.1 s），RTP seq 连续、PTS 墙钟重同步正常出声。
+- 周期心跳：每 10 s 发 0x001a，音箱逐条回 0x001b（观测 seq 16–21）。
+- **设备拆通道行为**：播报结束进入 `state=3` 后，音箱会关闭反向媒体通道 #3（观测窗口：空闲 23 s 未拆、43 s 已拆）。服务检测到 `media_seen 且 #3 消失` 后自动重新 SetPlaySource+Open，第四句在 50 s 空闲后仍正常 `done`（日志含完整 `re-bootstrapping` 路径）。
+- 抢占：`/stop` 在帧流动中约 0.1 s 内生效，job `stopped`（106 帧已播），worker 立即释放。
+- 修复两处验证中发现的缺陷：① TTS 云端挂起会永久阻塞 worker → 加 select 停止唤醒 + 30 s 停滞看门狗（部分音频照常flush）；② 通道丢失直接报错 → 改为 0 帧时自动重建会话重试一次（已播过半则不重放，避免半句重复）。
