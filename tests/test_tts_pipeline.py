@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from src.media.audio import iter_adts, send_adts_stream, RtpStreamState
 from src.tts import server as tts_server
+from src.tts.priming import send_with_priming, silence_frames
 from src.tts.speaker import SpeakerService
 
 HAVE_FFMPEG = subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0
@@ -127,7 +128,8 @@ class TestSpeakerServiceOffline(unittest.TestCase):
         sent = {"n": 0}
 
         class FakeSession:
-            def __init__(self, speaker_host=None, bind_ip=None, heartbeat_interval=0):
+            def __init__(self, speaker_host=None, bind_ip=None,
+                         heartbeat_interval=0, chime=True):
                 opens.append(self)
                 self.media_seen = True
                 self.calls = 0
@@ -167,7 +169,8 @@ class TestSpeakerServiceOffline(unittest.TestCase):
         opens = []
 
         class FakeSession:
-            def __init__(self, speaker_host=None, bind_ip=None, heartbeat_interval=0):
+            def __init__(self, speaker_host=None, bind_ip=None,
+                         heartbeat_interval=0, chime=True):
                 opens.append(self)
                 self.media_seen = True
             def open(self):
@@ -194,6 +197,87 @@ class TestSpeakerServiceOffline(unittest.TestCase):
                 self.assertEqual(len(opens), 1)  # no second bootstrap
             finally:
                 svc.shutdown()
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg required")
+class TestPriming(unittest.TestCase):
+    def _wires(self, sock):
+        seqs = []
+        pts_list = []
+        for w in sock.written:
+            assert w[:1] == b"$"
+            rtp = w[4:]
+            seqs.append(int.from_bytes(rtp[2:4], "big"))
+            pts_list.append(int.from_bytes(rtp[4:8], "big"))
+        return seqs, pts_list
+
+    def test_silence_frames_profile(self):
+        frames = silence_frames(1.0)
+        self.assertGreater(len(frames), 40)
+        for f in frames:
+            self.assertEqual(f[2] >> 6, 1)          # AAC-LC
+            self.assertEqual((f[2] >> 2) & 15, 3)   # 48 kHz
+            self.assertEqual(((f[2] & 1) << 2) | (f[3] >> 6), 2)  # stereo
+
+    def test_warm_start_sends_priming_then_speech(self):
+        frames = real_adts_frames()
+        ready = threading.Event(); ready.set()
+        stop = threading.Event()
+        state = RtpStreamState()
+        offset_us = 1792586533_607510  # any monotonic-domain value works
+        sock = BytesSocket()
+        send_with_priming(iter(frames), sock, stop, ready, ready,
+                          offset_us, state)
+        seqs, pts_list = self._wires(sock)
+        self.assertEqual(state.utterance, 1)
+        # RTP sequence strictly continuous across silence+speech
+        for a, b in zip(seqs, seqs[1:]):
+            self.assertEqual(b, (a + 1) & 0xFFFF)
+        # PTS advances in exact 1920 ticks per AU, starting at the origin
+        self.assertEqual(pts_list[0], offset_us * 90000 // 1_000_000 & 0xFFFFFFFF)
+        for a, b in zip(pts_list, pts_list[1:]):
+            self.assertEqual((b - a) & 0xFFFFFFFF, 1920)
+        # more AUs on the wire than speech alone (priming + margin included)
+        self.assertGreater(len(seqs), len(frames))
+
+    def test_cold_start_waits_for_readiness_before_speech(self):
+        frames = real_adts_frames(8)
+        ready = threading.Event()
+        stop = threading.Event()
+        state = RtpStreamState()
+        sock = BytesSocket()
+        t = threading.Timer(0.6, ready.set)
+        t.start()
+        try:
+            send_with_priming(iter(frames), sock, stop, ready, ready,
+                              1792586533_607510, state, ready_timeout=10.0)
+        finally:
+            t.cancel()
+        seqs, pts_list = self._wires(sock)
+        total_aus = (pts_list[-1] - pts_list[0]) // 1920 + 1
+        # readiness arrived ~0.6 s in: >= 0.6s worth of silence AUs, plus
+        # margin, plus all speech frames
+        self.assertGreaterEqual(total_aus, int(0.55 / (1024 / 48000)) + len(frames))
+        self.assertEqual(state.utterance, 1)
+
+    def test_never_ready_times_out_and_cleans_generator(self):
+        ready = threading.Event()  # never set
+        stop = threading.Event()
+        closed = {"flag": False}
+
+        def speech():
+            try:
+                for f in real_adts_frames(4):
+                    yield f
+            finally:
+                closed["flag"] = True
+
+        sock = BytesSocket()
+        with self.assertRaises(TimeoutError):
+            send_with_priming(speech(), sock, stop, ready, ready,
+                              1792586533_607510, RtpStreamState(),
+                              ready_timeout=0.8)
+        self.assertTrue(closed["flag"])
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg required")

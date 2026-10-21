@@ -19,13 +19,19 @@ import time
 from ..common import log
 from ..media.audio import iter_adts
 
-# Low-latency decode of the MP3 stream from edge-tts; output profile is fixed
-# to AAC-LC 48 kHz stereo 256 kb/s because iter_adts and the receiver both
-# require exactly that profile.
+# Decode the MP3 stream from edge-tts; output profile is fixed to AAC-LC
+# 48 kHz stereo 256 kb/s because iter_adts and the receiver both require
+# exactly that profile.
+# DO NOT add input latency flags (-fflags nobuffer / -flags low_delay /
+# -probesize / -analyzeduration): on a pipe input they make the MP3 demuxer
+# irreversibly discard probe data, silently EATING the first 0.4-1.0 s of
+# speech ("测试" vanished; live-verified + isolated offline 2026-10-21:
+# same file, no-flags onset 0.208 s vs 0.58-0.59 s with flags). The extra
+# first-frame latency is invisible because silence priming covers TTS
+# synthesis latency anyway.
 FFMPEG_TTS_CMD = [
     "ffmpeg", "-hide_banner", "-loglevel", "error",
-    "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "4096",
-    "-analyzeduration", "0", "-f", "mp3", "-i", "pipe:0",
+    "-f", "mp3", "-i", "pipe:0",
     "-vn", "-ac", "2", "-ar", "48000", "-c:a", "aac", "-profile:a", "aac_low",
     "-b:a", "256k", "-f", "adts", "pipe:1",
 ]

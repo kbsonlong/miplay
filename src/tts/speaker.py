@@ -26,7 +26,8 @@ from ..control.wire import frame, recv_frame, legacy_hmac
 from ..control.client import (HOST, CONTROL_PORT, RTSP_PORT, TIMER_PORT,
                               SOURCE_VERSION, SOURCE_NAME, SET_PLAY_SOURCE,
                               monitor_post_open_control)
-from ..media.audio import send_adts_stream, RtpStreamState
+from ..media.audio import RtpStreamState
+from .priming import send_with_priming, silence_frames, chime_frames
 from .engine import stream_tts_adts, DEFAULT_VOICE, DEFAULT_RATE
 
 
@@ -36,6 +37,7 @@ class Job:
     text: str
     voice: str = DEFAULT_VOICE
     rate: str = DEFAULT_RATE
+    chime: bool | None = None  # None = follow service default
     status: str = "queued"  # queued | playing | done | stopped | error
     error: str = ""
     enqueued_at: float = field(default_factory=time.time)
@@ -58,11 +60,13 @@ class MediaChannelError(RuntimeError):
 class SpeakerSession:
     """One MiPlay control/media session against the L15A."""
 
-    def __init__(self, speaker_host, bind_ip, heartbeat_interval=10.0):
+    def __init__(self, speaker_host, bind_ip, heartbeat_interval=10.0,
+                 chime=True):
         self.speaker_host = speaker_host
         self.bind_ip = bind_ip
         self.control_port = CONTROL_PORT
         self.heartbeat_interval = heartbeat_interval
+        self.chime = chime
         self.services = None
         self.control = None
         self.seq = 14  # V14 bootstrap uses seq<=14 (Open); heartbeats continue after
@@ -282,13 +286,15 @@ class SpeakerSession:
                 job.frames += 1
                 yield f
 
+        use_chime = job.chime if job.chime is not None else self.chime
         try:
-            send_adts_stream(
+            send_with_priming(
                 counting(stream_tts_adts(job.text, job.voice, job.rate,
                                          stop_event=job.stop)),
                 media_sock, job.stop,
                 self.services.first_pcm_ready, self.services.receiver_playing_ready,
-                self.services.time_offset_us, state=self.state)
+                self.services.time_offset_us, state=self.state,
+                lead_frames=(chime_frames() if use_chime else None))
         except ValueError as exc:
             if not job.stop.is_set():
                 raise
@@ -319,10 +325,11 @@ class SpeakerService:
     """Queue-driven facade: submit text jobs, one utterance plays at a time."""
 
     def __init__(self, speaker_host=HOST, bind_ip="192.168.3.18",
-                 heartbeat_interval=10.0):
+                 heartbeat_interval=10.0, chime=True):
         self.speaker_host = speaker_host
         self.bind_ip = bind_ip
         self.heartbeat_interval = heartbeat_interval
+        self.chime = chime
         self.session = None
         self.jobs: dict[str, Job] = {}
         self.jobs_lock = threading.Lock()
@@ -334,8 +341,10 @@ class SpeakerService:
         self._worker.start()
         log(f"SERVICE worker started (speaker={self.speaker_host} bind={self.bind_ip})")
 
-    def submit(self, text, voice=DEFAULT_VOICE, rate=DEFAULT_RATE) -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], text=text, voice=voice, rate=rate)
+    def submit(self, text, voice=DEFAULT_VOICE, rate=DEFAULT_RATE,
+               chime=None) -> Job:
+        job = Job(id=uuid.uuid4().hex[:12], text=text, voice=voice, rate=rate,
+                  chime=chime)
         with self.jobs_lock:
             self.jobs[job.id] = job
             if len(self.jobs) > 100:
@@ -394,7 +403,8 @@ class SpeakerService:
             self.session.close()
             self.session = None
         sess = SpeakerSession(self.speaker_host, self.bind_ip,
-                              heartbeat_interval=self.heartbeat_interval)
+                              heartbeat_interval=self.heartbeat_interval,
+                              chime=self.chime)
         sess.open()
         self.session = sess
         log("SESSION bootstrapped")

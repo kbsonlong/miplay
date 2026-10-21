@@ -99,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
         voice = str(payload.get("voice") or DEFAULT_VOICE)
         rate = str(payload.get("rate") or DEFAULT_RATE)
         blocking = bool(payload.get("blocking", False))
+        chime = payload.get("chime")
+        if chime is not None and not isinstance(chime, bool):
+            self._json(400, {"error": "chime must be true/false"})
+            return
         if not text:
             self._json(400, {"error": "text is required"})
             return
@@ -108,7 +112,7 @@ class Handler(BaseHTTPRequestHandler):
         if not RATE_RE.match(rate):
             self._json(400, {"error": "rate must look like +10% / -5%"})
             return
-        job = self.service.submit(text, voice=voice, rate=rate)
+        job = self.service.submit(text, voice=voice, rate=rate, chime=chime)
         log(f"HTTP /tts accepted job={job.id} voice={voice} len={len(text)}")
         if not blocking:
             self._json(202, {"id": job.id, "status": "queued", **self.service.status()})
@@ -120,15 +124,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(listen_host, listen_port, speaker_host, bind_ip, token,
-          heartbeat_interval, voice):
+          heartbeat_interval, voice, chime):
     service = SpeakerService(speaker_host=speaker_host, bind_ip=bind_ip,
-                             heartbeat_interval=heartbeat_interval)
+                             heartbeat_interval=heartbeat_interval, chime=chime)
     service.start()
     Handler.service = service
     Handler.token = token
     httpd = ThreadingHTTPServer((listen_host, listen_port), Handler)
     log(f"HTTP listening on {listen_host}:{listen_port} "
-        f"(speaker={speaker_host}, default voice={voice})")
+        f"(speaker={speaker_host}, default voice={voice}, chime={chime})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -146,12 +150,16 @@ def main():
     p.add_argument("--token", default="", help="require this X-Token on POST endpoints")
     p.add_argument("--heartbeat", type=float, default=10.0,
                    help="control heartbeat seconds; 0 disables")
+    p.add_argument("--chime", action=argparse.BooleanOptionalAction, default=True,
+                   help="play a short attention chime before each message "
+                        "(recommended: the receiver drops ~0.5s at speech onset)")
     p.add_argument("--voice", default=DEFAULT_VOICE, help="default voice for /tts")
     a = p.parse_args()
     host, _, port = a.listen.rpartition(":")
     if not host or not port.isdigit():
         p.error("--listen must be host:port")
-    serve(host, int(port), a.speaker, a.bind_ip, a.token, a.heartbeat, a.voice)
+    serve(host, int(port), a.speaker, a.bind_ip, a.token, a.heartbeat,
+          a.voice, a.chime)
 
 
 if __name__ == "__main__":
