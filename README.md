@@ -42,7 +42,12 @@ l15a-miplay/
 │   └── media/
 │       ├── __init__.py
 │       ├── mpegts.py                # PAT/PMT/PCR/PES/TS
-│       └── audio.py                 # ffmpeg ADTS → RTP → MiPlay TCP
+│       └── audio.py                 # ADTS 帧流 → RTP → MiPlay TCP（文件/流式同管线）
+├── src/tts/                         # 流式 TTS 服务（Agent 可调用）
+│   ├── __init__.py
+│   ├── engine.py                    # edge-tts MP3 流 → FFmpeg → AAC ADTS 帧流
+│   ├── speaker.py                   # 长驻会话/心跳/播报队列/自动重建
+│   └── server.py                    # stdlib HTTP API（python3 -m src.tts.server）
 ├── tools/
 │   └── inspect_pcap.py              # 标准库 PCAP 重组 / RTP、PCR、PTS 检查
 ├── examples/
@@ -102,6 +107,34 @@ python3 -m unittest discover -s tests -v
 
 模块化实机测试可改为 `python3 miplay_client.py --connect ...`，但它还没有取得原始 V14 那样的真机出声验证，因此应先保存原始 V14 的成功日志和 PCAP 用于比较。
 
+## 流式 TTS 服务（Agent 调用）
+
+在文件播放管线之上提供常驻 HTTP 服务：文字请求 → edge-tts 云端流式合成 MP3 → FFmpeg 转码 AAC-LC 48 kHz → 与 V14 相同的 PES/TS/RTP 管线推到音箱。实测 12.35 s 语音**首帧延迟约 1.9 s**、总出流耗时 2.56 s（合成未结束即开始播报）。
+
+依赖：Python ≥ 3.9 + `edge-tts`（`pip install edge-tts`，需能访问 `speech.platform.bing.com`）+ FFmpeg。
+
+```bash
+# 启动（默认监听 0.0.0.0:9901，音箱 192.168.3.4，回连 IP 192.168.3.18）
+python3 -m src.tts.server --listen 0.0.0.0:9901 --speaker 192.168.3.4
+
+# Agent 提交播报（异步，202 + job id；blocking=true 则等待播完）
+curl -s -X POST http://127.0.0.1:9901/tts -H 'Content-Type: application/json' \
+  -d '{"text":"主人你好，水温已达标。","voice":"zh-CN-XiaoxiaoNeural","rate":"+0%"}'
+
+curl -s http://127.0.0.1:9901/jobs/<id>     # 查询状态
+curl -s http://127.0.0.1:9901/health        # 会话/队列快照
+curl -s http://127.0.0.1:9901/voices        # 可用音色
+curl -s -X POST http://127.0.0.1:9901/stop  # 抢占当前播报并清空队列
+```
+
+行为要点：
+
+- **会话复用**：第一次请求触发完整 V14 bootstrap（含 Open）；后续播报复用同一反向媒体通道 #3，RTP seq/TS 计数连续，PTS 重同步到墙钟（与 PCR 同域）。
+- **自动重建**：控制连接断开或心跳连续失败时，下次请求自动重新 bootstrap；单次失败只报错该 job，服务存活。
+- **抢占**：`/stop` 立即打断当前播报并清空队列。
+- **心跳**：默认每 10 s 发 0x001a（`--heartbeat 0` 关闭）。周期心跳与连续播报的 PTS 重同步**尚未实机验证**，首次上机请对照 V14 基线。
+- **安全**：仅限局域网使用；可加 `--token <secret>` 要求写操作携带 `X-Token`。
+
 ## 常用抓包和离线验证
 
 ```bash
@@ -146,7 +179,7 @@ ffprobe -v error -show_streams /tmp/l15a.ts
 ## 已知限制
 
 - 原始 V14 是有限生命周期的文件播放 POC。Open 前验证心跳，但还不支持稳定的周期控制心跳；RTSP 循环设有约 35 秒硬期限。
-- 单次发送固定文件，不支持 HTTP API、连续 TTS 队列、流式 TTS、抢占、自动重连或完整 TEARDOWN。
+- 单次发送固定文件，不支持连续 TTS 队列或抢占；**流式 TTS 由 `src/tts/` 服务承担**（心跳周期、连续播报 PTS 重同步尚未实机验证）。
 - `VIDEO_LATENCY` 被记录但未响应或解析统计；离线抓包无法直接证明真实扬声器输出延迟。
 - 仅验证 L15A 指定固件及网络；不保证兼容所有型号/固件。
 - 原始 V14 的 docstring/CLI 描述保留早期版本文案，**它们是过期注释**；请以实际代码和已实测结果为准。
