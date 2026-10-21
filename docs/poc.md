@@ -73,7 +73,7 @@ V14 实际涉及三种通信角色。
 | 通道               | 连接方向                             | 功能                             |
 | ---------------- | -------------------------------- | ------------------------------ |
 | MiPlay 控制        | Mac → L15A:8899                  | 认证、设备查询、Open、SetMediaInfo、状态通知 |
-| RTSP / WFD       | L15A → Mac:7274                  | 能力协商、SETUP、PLAY、TIME_OFFSET    |
+| RTSP / WFD       | L15A → Mac:7274                  | 能力协商、SETUP、PLAY、TIME\_OFFSET   |
 | UDP TimerService | L15A → Mac:36524                 | 同步发送端和接收端的单调时间                 |
 | RTP 媒体           | L15A 建立 TCP → Mac:7274；Mac 写入该连接 | 传输 AAC/MPEG-TS 音频              |
 
@@ -151,7 +151,7 @@ sequenceDiagram
 
 MiPlay Legacy 使用自定义二进制帧：
 
-![Legacy 控制帧](../statics/image.png)
+<br />
 
 V14 的编码实现：
 
@@ -242,14 +242,6 @@ wfd://192.168.3.18:7274?mirrorMode=1\0
 ### 3. RTSP：能力协商与播放会话
 
 V14 按以下顺序协商：
-
-1. `OPTIONS`，通告 WFD 与 TimerService 地址。
-2. `GET_PARAMETER`，获取音箱支持的能力。
-3. `SET_PARAMETER`，选择 AAC 和 TCP interleaved 媒体传输。
-4. `SET_PARAMETER wfd_trigger_method: SETUP`，要求建立会话。
-5. 响应音箱的 `SETUP`。
-6. 响应音箱的 `PLAY`。
-7. 发送 `TIME_OFFSET` 并等待 `200 OK`。
 
 关键音频协商字段：
 
@@ -375,7 +367,7 @@ ffmpeg -hide_banner -loglevel error \
 
 因此：
 
-\\[ \Delta PTS=\frac{1024}{48000}\times90000=1920 \\]
+$\Delta PTS=\frac{1024}{48000}\times90000=1920$
 
 ### 3. MPEG-TS 结构
 
@@ -420,19 +412,7 @@ V14 在首个 AAC AU，以及从 AU #13 开始每间隔 5 个 AU，插入 PAT、
 
 ### 4. RTP 结构
 
-MiPlay 媒体帧
-
-$
-
-Length · 24 bit
-
-RTP packet
-
-RTP header · 12 bytes
-
-TS × 1～7
-
-自定义 TCP 帧长度不包含前面的 4 字节封装头；Length 表示整个 RTP packet 的长度。
+![RTP 结构](../statics/RTP.png)
 
 RTP 关键参数：
 
@@ -473,18 +453,13 @@ for off in range(0, len(packets), 7):
 
 成功抓包共计 224 个 RTP 帧，其中 216 个设置 Marker，另外 8 个未设置 Marker。这和 216 个 AAC AU 及少量 RTP 分片的行为相符。
 
-## 五、最关键突破：V14 的 TIME_OFFSET、PTS 与 PCR
+## 五、最关键突破：V14 的 TIME\_OFFSET、PTS 与 PCR
 
 这是整个调试过程中决定性的一步。
 
 ### 1. 为什么 V13 之前始终无声
 
 V13 已经具备：
-
-- Legacy 认证、Open、RTSP SETUP/PLAY；
-- SetMediaInfo 以及 `state=2` 通知；
-- AAC/MPEG-TS/RTP 的完整发送；
-- 正常可解码的 AAC 数据。
 
 但是 V13 的发送代码仍然是：
 
@@ -553,11 +528,17 @@ pcr_extension = pcr27 % 300
 
 这个修复把三个相关的时间量建立了联系：
 
-\\[ T\_{\text{offset}} = \operatorname{monotonic\\\_us}() \\]
+$$
+T_{\text{offset}} = \mathop{\mathrm{monotonic\_us}}()
+$$
 
-\\[ PTS_0 = \left\lfloor \frac{T\_{\text{offset}}\times90000}{10^6} \right\rfloor \bmod 2^{32} \\]
+$$
+PTS_0 = \left\lfloor \frac{T_{\text{offset}}\times90000}{10^6} \right\rfloor \bmod 2^{32}
+$$
 
-\\[ PCR\_{\text{27MHz}} = \operatorname{monotonic\\\_us}()\times27 \\]
+$$
+PCR_{\text{27MHz}} = \mathop{\mathrm{monotonic\_us}}()\times27
+$$
 
 需要注意：V14 并不是让 PTS 和 PCR 数值完全相等。它们分别在 RTSP 发送时和媒体打包时采样，并有不同的时间戳位宽；正确做法是对齐时间域，再考虑采样间隔和回绕。
 
@@ -667,7 +648,7 @@ ffprobe -version
 ```
 say -v Ting-Ting \
   -o /tmp/l15a-v7-test.aiff \
-  "你好小米音箱，这是本地 MiPlay 音频发送测试。"
+  "第二句。第三句。第四句。第五句。第六句。"
 ```
 
 ### 3. 验证音频输入
@@ -868,7 +849,7 @@ ESP32-S3 / Home Assistant / Local AI Agent
 | `LegacyControlClient` | TCP 8899 握手、认证、设备状态、周期心跳                |
 | `MiPlayRtspSession`   | 反向 TCP、RTSP 状态机、SETUP/PLAY/TEARDOWN     |
 | `MiPlayTimerService`  | UDP 时钟同步                                |
-| `MiPlayMediaClock`    | TIME_OFFSET、PTS、PCR 时间管理                |
+| `MiPlayMediaClock`    | TIME\_OFFSET、PTS、PCR 时间管理               |
 | `AacEncoder`          | PCM/TTS 转为 AAC Access Units             |
 | `MpegTsMuxer`         | PAT、PMT、PCR、PES、188 字节 TS               |
 | `RtpSender`           | RTP 封装、分片、发送节奏                          |
@@ -882,11 +863,6 @@ ESP32-S3 / Home Assistant / Local AI Agent
 ## 十、最终结论
 
 本次调试最终证明了：
-
-1. 小米 L15A 原厂固件支持通过局域网 Legacy MiPlay/WFD 会话接收自定义 AAC 音频。
-2. 通过 TCP 8899、RTSP、UDP TimerService 和独立 RTP 媒体连接，可以在第三方发送端实现完整的本地播放链路。
-3. PAT/PMT/PES/RTP 封装、SetMediaInfo 和播放状态通知都重要，但V13 → V14 最关键的修复是 PTS/RTP 与 TIME_OFFSET/PCR 时间域的关联。
-4. V14 已通过实机有声播放验证，可以作为后续 Python Gateway、Go 实现或者 ESP32-S3 集成的协议基准。
 
 建议将 `miplay_client_v14.py` 与成功的 `l15a-v14-media(1).pcap` 一起作为回归测试资产永久保存。任何后续重构都应该能够复现这次成功的控制时序、媒体帧结构和时间戳关系。
 
