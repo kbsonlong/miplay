@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "l15a-miplay-local-sender"
+version = "0.1.0"
+description = "Unofficial locally tested L15A MiPlay sender research prototype"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{name = "l15a-miplay contributors"}]
+keywords = ["miplay", "l15a", "rtsp", "aac", "mpeg-ts"]
+
+[tool.setuptools]
+packages = ["src", "src.control", "src.rtsp", "src.timer", "src.media"]
+
+[project.scripts]
+l15a-miplay = "src.cli:main"
