@@ -113,6 +113,22 @@ python3 -m unittest discover -s tests -v
 
 依赖：Python ≥ 3.9 + `edge-tts`（`pip install edge-tts`，需能访问 `speech.platform.bing.com`）+ FFmpeg。
 
+### 局域网自动发现音箱
+
+```bash
+# 独立扫描 CLI（协议级验证，排除本机；~0.5s 完成）
+python3 -m src.discovery [--base 192.168.3]
+
+# 服务启动时自动发现并锁定音箱（IP 变动/换网段免配置）
+python3 -m src.tts.server --speaker auto --listen 0.0.0.0:9901
+
+# 运行时重新扫描并热切换音箱（音箱 IP 变了不用重启服务）
+curl -s http://127.0.0.1:9901/discover
+# -> {"base":"192.168.3","speakers":["192.168.3.4"],"all_responders":[...]}
+```
+
+发现原理：并发探测本网段 /24 的 TCP/8899，真 L15A 对新控制连接回 `$ 0x0028` + **16/17 位十进制挑战**（与 V14 bootstrap 校验一致）；其他应答者（如本机 `miplay-br` 桥接，14 位挑战）标记为 `miplay-like` 不误选，本机 IP 一律跳过。
+
 ```bash
 # 启动（默认监听 0.0.0.0:9901，音箱 192.168.3.4，回连 IP 192.168.3.18）
 python3 -m src.tts.server --listen 0.0.0.0:9901 --speaker 192.168.3.4

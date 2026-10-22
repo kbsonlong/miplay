@@ -66,6 +66,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", **self.service.status()})
         elif path == "/voices":
             self._json(200, {"voices": VOICES, "default": DEFAULT_VOICE})
+        elif path == "/discover":
+            from ..discovery import scan_lan, default_base
+            base = default_base()
+            found = scan_lan(base)
+            speakers = [d["ip"] for d in found if d["kind"] == "speaker"]
+            if speakers:
+                previous = self.service.speaker_host
+                self.service.speaker_host = speakers[0]
+                if previous != speakers[0] and self.service.session:
+                    # Force a fresh bootstrap against the new target.
+                    self.service.session.close()
+                    self.service.session = None
+                log(f"HTTP /discover switched speaker {previous} -> {speakers[0]}")
+            responders = [{"ip": d["ip"], "kind": d["kind"],
+                           "raw_hex": d["raw"].hex()} for d in found]
+            self._json(200, {"base": base, "speakers": speakers,
+                             "all_responders": responders})
         elif path.startswith("/jobs/"):
             job = self.service.get_job(path.split("/jobs/", 1)[1])
             if job is None:
@@ -123,8 +140,25 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, self.service.job_view(job))
 
 
+def resolve_speaker(speaker_arg: str) -> str:
+    """Resolve --speaker; 'auto' scans the LAN for a genuine L15A."""
+    if speaker_arg != "auto":
+        return speaker_arg
+    from ..discovery import discover_speakers, default_base
+    base = default_base()
+    ips = discover_speakers(base)
+    if not ips:
+        raise SystemExit(f"--speaker auto: no L15A speaker found on {base}.0/24")
+    if len(ips) > 1:
+        log(f"AUTO multiple speakers found {ips}; using {ips[0]}")
+    else:
+        log(f"AUTO discovered speaker {ips[0]} on {base}.0/24")
+    return ips[0]
+
+
 def serve(listen_host, listen_port, speaker_host, bind_ip, token,
           heartbeat_interval, voice, chime):
+    speaker_host = resolve_speaker(speaker_host)
     service = SpeakerService(speaker_host=speaker_host, bind_ip=bind_ip,
                              heartbeat_interval=heartbeat_interval, chime=chime)
     service.start()
@@ -145,7 +179,9 @@ def serve(listen_host, listen_port, speaker_host, bind_ip, token,
 def main():
     p = argparse.ArgumentParser(description="MiPlay streaming TTS server for agents")
     p.add_argument("--listen", default="0.0.0.0:9901", help="host:port for the HTTP API")
-    p.add_argument("--speaker", default="192.168.3.4", help="L15A MiPlay control address")
+    p.add_argument("--speaker", default="192.168.3.4",
+                   help="L15A MiPlay control address, or 'auto' to discover "
+                        "on the LAN at startup")
     p.add_argument("--bind-ip", default="192.168.3.18", help="local IP the speaker dials back to")
     p.add_argument("--token", default="", help="require this X-Token on POST endpoints")
     p.add_argument("--heartbeat", type=float, default=10.0,
