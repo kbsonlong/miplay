@@ -48,6 +48,9 @@ l15a-miplay/
 │   ├── engine.py                    # edge-tts MP3 流 → FFmpeg → AAC ADTS 帧流
 │   ├── speaker.py                   # 长驻会话/心跳/播报队列/自动重建
 │   └── server.py                    # stdlib HTTP API（python3 -m src.tts.server）
+├── skills/
+│   └── miplay-device-reverse-engineering/
+│       └── SKILL.md                 # 新设备发现、协议解析、抓包与实机验证流程
 ├── tools/
 │   └── inspect_pcap.py              # 标准库 PCAP 重组 / RTP、PCR、PTS 检查
 ├── examples/
