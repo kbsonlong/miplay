@@ -119,8 +119,11 @@ python3 -m unittest discover -s tests -v
 ### 局域网自动发现音箱
 
 ```bash
-# 独立扫描 CLI（协议级验证，排除本机；~0.5s 完成）
-python3 -m src.discovery [--base 192.168.3]
+# 独立扫描 CLI（自动从本机路由/网卡推导 LAN CIDR，协议级验证）
+python3 -m src.discovery
+
+# 仅在排障时显式覆盖扫描范围（正常 Agent 不需要）
+python3 -m src.discovery --base <lan-cidr-or-prefix>
 
 # 服务启动时自动发现并锁定音箱（IP 变动/换网段免配置）
 python3 -m src.tts.server --speaker auto --listen 0.0.0.0:9901
@@ -135,8 +138,8 @@ curl -s http://127.0.0.1:9901/discover
 当前协议画像：L15A 16/17 位 challenge → `speaker`（媒体已验证）；L16B 等新 Xiaomi 设备 12/13 位 challenge → 继续执行 challenge/HMAC/version/GetDeviceInfo，成功后标记 `miplay-speaker` 并记录 model/version/device_info。`--speaker auto` 目前只选择 `speaker`（L15A），L16B 需要完成音频媒体实机验证后再纳入自动播放。
 
 ```bash
-# 启动（默认监听 0.0.0.0:9901，音箱 192.168.3.4，回连 IP 192.168.3.18）
-python3 -m src.tts.server --listen 0.0.0.0:9901 --speaker 192.168.3.4
+# 启动：自动根据本机路由/网卡发现音箱，并自动选择已验证设备
+python3 -m src.tts.server --listen 0.0.0.0:9901 --speaker auto
 
 # Agent 提交播报（异步，202 + job id；blocking=true 则等待播完）
 curl -s -X POST http://127.0.0.1:9901/tts -H 'Content-Type: application/json' \

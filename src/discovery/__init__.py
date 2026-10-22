@@ -22,6 +22,8 @@ import socket
 import struct
 import threading
 import time
+import fcntl
+import ipaddress
 from typing import List, Optional
 
 from ..control.wire import frame, recv_frame, legacy_hmac
@@ -55,6 +57,44 @@ def local_ips() -> List[str]:
     except OSError:
         pass
     return ips
+
+
+def local_networks() -> List[ipaddress.IPv4Network]:
+    """Return routed IPv4 LAN networks from local interfaces.
+
+    Uses interface address/netmask ioctls on macOS/Linux and falls back to a
+    conservative /24 only when the platform does not expose them. Loopback,
+    link-local, multicast, and point-to-point networks are excluded.
+    """
+    networks = []
+    for ifindex, ifname in socket.if_nameindex():
+        name = ifname.encode()[:15]
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            addr = fcntl.ioctl(sock.fileno(), 0xC0206921,
+                               struct.pack('256s', name))[20:24]
+            mask = fcntl.ioctl(sock.fileno(), 0xC0206925,
+                               struct.pack('256s', name))[20:24]
+            sock.close()
+            ip = ipaddress.IPv4Address(addr)
+            mask_int = int.from_bytes(mask, 'big')
+            net = ipaddress.IPv4Network((int(ip), mask_int), strict=False)
+            if (not ip.is_loopback and not ip.is_link_local and
+                    not net.is_loopback and not net.is_link_local and
+                    not net.is_multicast and net.prefixlen < 32 and
+                    net not in networks):
+                networks.append(net)
+        except (OSError, ValueError):
+            continue
+    if networks:
+        return networks
+    base = default_base()
+    return [ipaddress.IPv4Network(f'{base}.0/24')]
+
+
+def discovery_networks() -> List[str]:
+    """Human/CLI-friendly CIDR strings for all routed LAN candidates."""
+    return [str(net) for net in local_networks()]
 
 
 def parse_miplay_frame(data: bytes):
@@ -175,7 +215,7 @@ def _probe(ip: str, port: int, timeout: float, send_probe: bool):
         return ip, None
 
 
-def scan_lan(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
+def scan_lan(base_ip: Optional[str] = None, port: int = CONTROL_PORT,
              timeout: float = 0.5, workers: int = 60,
              skip_ips: Optional[List[str]] = None) -> List[dict]:
     """Scan base_ip.0/24; return descriptors of everything answering on *port*.
@@ -183,9 +223,22 @@ def scan_lan(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
     Descriptor: {"ip", "kind" ("speaker"|"miplay-like"|"unknown"), "raw"}.
     """
     skip = set(skip_ips if skip_ips is not None else local_ips())
+    if base_ip is None:
+        networks = local_networks()
+        if not networks:
+            return []
+        # Preserve the historical return shape while scanning all routed LANs.
+        all_found = []
+        for network in networks:
+            all_found.extend(scan_lan(str(network), port, timeout, workers, list(skip)))
+        return sorted(all_found, key=lambda d: d["ip"])
+    if "/" in base_ip:
+        network = ipaddress.ip_network(base_ip, strict=False)
+        hosts = [str(ip) for ip in network.hosts()]
+    else:
+        hosts = [f"{base_ip}.{i}" for i in range(1, 255)]
     q: "queue.Queue[str]" = queue.Queue()
-    for i in range(1, 255):
-        ip = f"{base_ip}.{i}"
+    for ip in hosts:
         if ip not in skip:
             q.put(ip)
 
@@ -236,14 +289,14 @@ def default_base() -> str:
     return "192.168.3"
 
 
-def discover_speakers(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
+def discover_speakers(base_ip: Optional[str] = None, port: int = CONTROL_PORT,
                       timeout: float = 0.5) -> List[str]:
     """Return only L15A IPs whose media path is currently verified."""
     return [d["ip"] for d in scan_lan(base_ip, port, timeout)
             if d["kind"] == "speaker"]
 
 
-def discover_miplay_devices(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
+def discover_miplay_devices(base_ip: Optional[str] = None, port: int = CONTROL_PORT,
                             timeout: float = 0.5) -> List[dict]:
     """Return L15A and model-confirmed newer MiPlay speaker profiles."""
     return [d for d in scan_lan(base_ip, port, timeout)
@@ -252,11 +305,14 @@ def discover_miplay_devices(base_ip: str = "192.168.3", port: int = CONTROL_PORT
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Discover MiPlay L15A speakers on the LAN")
-    p.add_argument("--base", default="192.168.3", help="/24 segment base, e.g. 192.168.3")
+    p.add_argument("--base", default=None,
+                   help="optional CIDR/base override; default derives all routed LANs")
     p.add_argument("--timeout", type=float, default=0.5)
     a = p.parse_args()
     from ..common import log
-    log(f"DISCOVERY scanning {a.base}.0/24 (excluding {', '.join(local_ips()) or 'localhost'})")
+    targets = [a.base] if a.base else discovery_networks()
+    log(f"DISCOVERY scanning {', '.join(targets)} "
+        f"(excluding {', '.join(local_ips()) or 'localhost'})")
     found = scan_lan(a.base, timeout=a.timeout)
     speakers = [d for d in found if d["kind"] in ("speaker", "miplay-speaker")]
     for d in found:

@@ -30,11 +30,15 @@ Runtime:
 
 - Python: `~/.pyenv/shims/python3` (edge-tts is installed there)
 - FFmpeg: `/opt/homebrew/bin/ffmpeg`
-- Verified L15A: `192.168.3.4`, firmware `1.92.16`
-- Verified source Mac: `192.168.3.18`
+- Historical verified L15A case: one private-LAN address, firmware `1.92.16`
+- Historical verified source case: one private-LAN address on macOS
 - MiPlay control: speaker TCP `8899`
 - Reverse RTSP/media listener: source TCP `7274`
 - TimerService: source UDP `36524`
+
+Never copy historical IPs into a new Agent or device investigation. The
+Agent must derive its own source interfaces, routes, multicast interface, and
+candidate LAN CIDRs at runtime.
 
 The L15A audio path is verified end-to-end. The L16B path was subsequently verified end-to-end with a short test utterance, but do not generalize that result to every Xiaomi model or firmware.
 
@@ -54,14 +58,29 @@ A successful control handshake is not proof of audio compatibility. A job return
 
 ## Phase 1: Discover the LAN device
 
-### 1. Determine the local LAN and interface
+### 1. Derive local interfaces, routes, and LAN CIDRs
 
 ```bash
 ifconfig
-route -n get 192.168.3.4
+route -n get default
+route -n get 224.0.0.251
+netstat -rn -f inet
 ```
 
-The project discovery code derives the local non-loopback IPv4 and scans its `/24`. If the LAN is not `/24`, do not silently scan a different range; add an explicit range implementation first.
+Use the default route and interface addresses/netmasks to identify local
+candidate LANs. Prefer the route to `224.0.0.251` for the mDNS interface.
+Do not assume `/24`: preserve the actual netmask/CIDR and scan only the
+resulting private/link-local LAN candidates. Exclude loopback, multicast,
+point-to-point, VPN, and public interfaces unless explicitly scoped.
+
+The project derives these networks automatically:
+
+```python
+from src.discovery import discovery_networks, local_ips, local_networks
+print(local_ips())
+print(discovery_networks())
+print(local_networks())
+```
 
 ### 2. Browse mDNS/Bonjour without sending control traffic
 
@@ -78,15 +97,15 @@ dns-sd -B _sonos._tcp local
 dns-sd -B _dlna._tcp local
 ```
 
-Resolve a discovered instance:
+Resolve a discovered instance (replace placeholders with the observed data):
 
 ```bash
-dns-sd -L 'Xiaomi Sound-9457' _airplay._tcp local
-dns-sd -L '90FB5D0F2F19@Xiaomi Sound-9457' _raop._tcp local
-dscacheutil -q host -a name L16B-9457.local
+dns-sd -L '<instance-name>' _airplay._tcp local
+dns-sd -L '<raop-instance-name>' _raop._tcp local
+dscacheutil -q host -a name <discovered-host>.local
 ```
 
-Record instance, hostname, IP, port, model, firmware, MAC/device ID, and TXT keys. mDNS is useful but model-dependent: the verified L16B broadcasts `_airplay._tcp` and `_raop._tcp` on port 7000; the verified L15A did not expose a useful standard mDNS speaker service.
+Record instance, hostname, IP, port, model, firmware, MAC/device ID, and TXT keys. mDNS is useful but model-dependent: the verified L16B broadcasts `_airplay._tcp` and `_raop._tcp` on port 7000; the verified L15A did not expose a useful standard mDNS speaker service. mDNS absence is not proof that a speaker is absent.
 
 ### 3. Probe MiPlay TCP/8899
 
@@ -94,12 +113,15 @@ The project CLI is:
 
 ```bash
 cd ~/miplay
-~/.pyenv/shims/python3 -m src.discovery --base 192.168.3 --timeout 0.8
+~/.pyenv/shims/python3 -m src.discovery --timeout 0.8
 ```
+
+The command derives all eligible local LAN CIDRs automatically. Use
+`--base <CIDR-or-prefix>` only for a deliberate, user-approved override.
 
 The scanner:
 
-- concurrently connects to `/24` TCP port 8899;
+- concurrently connects to TCP port 8899 on every derived LAN candidate;
 - sends a minimal `$`-framed probe;
 - parses the first frame;
 - skips local IPs;
@@ -139,7 +161,7 @@ Use the read-only DeviceInfo probe:
 
 ```python
 from src.discovery import probe_device_info
-print(probe_device_info('192.168.3.113'))
+print(probe_device_info('<discovered-speaker-ip>'))
 ```
 
 The probe performs only:
@@ -169,7 +191,7 @@ sudo ./examples/capture.sh /tmp/miplay-device.pcap
 The script expands to:
 
 ```bash
-HOST=192.168.3.113
+HOST=<discovered-speaker-ip>
 IFACE="$(route -n get "$HOST" | awk '/interface:/{print $2; exit}')"
 sudo tcpdump -i "$IFACE" -nn -s 0 -U -w /tmp/miplay-device.pcap \
   "host $HOST and (tcp port 8899 or tcp port 7274 or udp port 36524)"
@@ -328,8 +350,8 @@ Use a temporary server bound to the target IP:
 cd ~/miplay
 ~/.pyenv/shims/python3 -m src.tts.server \
   --listen 127.0.0.1:9902 \
-  --speaker 192.168.3.113 \
-  --bind-ip 192.168.3.18
+  --speaker <discovered-speaker-ip> \
+  --bind-ip <source-ip-derived-from-route>
 ```
 
 Submit a short, unambiguous sentence:

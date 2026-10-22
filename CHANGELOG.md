@@ -67,3 +67,10 @@
 - L16B 返回版本 `2.1.4052010`，DeviceInfo 解析出 `miName=Xiaomi Sound`、`model=L16B`、`deviceType=4`、`channel=center`、设备 ID 等；只读 ACK 差异：L15A 的 `0x000e/0x001c` 在 L16B 返回 `0x000f/0x001d`。
 - 已实测 `SetPlaySource/Open`：L16B 建立反向 TCP #1/#2/#3，TimerService UDP 时钟同步成功，RTSP `OPTIONS → GET_PARAMETER → SETUP → PLAY → TIME_OFFSET` 全部完成，`rtsp_ready=True`；本次刻意未发送 SetMediaInfo/音频。
 - 发现器升级为 challenge 分类 + 物理设备 DeviceInfo 画像：`192.168.3.113` 标记 `miplay-speaker(model=L16B)`，`192.168.3.4` 标记已验证 `speaker(L15A)`；`--speaker auto` 仍只选 L15A，避免未经媒体验证自动切换。
+
+### 2026-10-22 discovery generalization
+
+- 移除新 Agent 流程对历史实验 IP/固定 `/24` 的依赖：`src.discovery` 现在从本机 IPv4 接口 netmask 推导所有候选 LAN CIDR，自动排除 loopback/link-local/multicast，支持多网卡/多 LAN；`--base` 仅作为显式排障覆盖。
+- mDNS/Bonjour 作为第一层发现（服务类型与路由到 `224.0.0.251` 的接口由运行环境决定），MiPlay TCP/8899 作为协议专用补充探针。
+- `--speaker auto` 与 `GET /discover` 均使用自动推导的网络集合；历史 IP 仅保留在实验记录，不作为默认配置。
+- 全套 41 项测试通过；实机默认 discovery 在当前网络发现 L15A 与 L16B。

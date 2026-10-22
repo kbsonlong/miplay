@@ -67,9 +67,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/voices":
             self._json(200, {"voices": VOICES, "default": DEFAULT_VOICE})
         elif path == "/discover":
-            from ..discovery import scan_lan, default_base
-            base = default_base()
-            found = scan_lan(base)
+            from ..discovery import scan_lan, discovery_networks
+            networks = discovery_networks()
+            found = scan_lan(None)
             speakers = [d["ip"] for d in found
                         if d["kind"] in ("speaker", "miplay-speaker")]
             if speakers:
@@ -89,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
                            "model": d.get("model"), "version": d.get("version"),
                            "device_info": d.get("device_info", {}),
                            "raw_hex": d["raw"].hex()} for d in found]
-            self._json(200, {"base": base, "speakers": speakers,
+            self._json(200, {"networks": networks, "speakers": speakers,
                              "all_responders": responders})
         elif path.startswith("/jobs/"):
             job = self.service.get_job(path.split("/jobs/", 1)[1])
@@ -152,15 +152,15 @@ def resolve_speaker(speaker_arg: str) -> str:
     """Resolve --speaker; 'auto' scans the LAN for a genuine L15A."""
     if speaker_arg != "auto":
         return speaker_arg
-    from ..discovery import discover_speakers, default_base
-    base = default_base()
-    ips = discover_speakers(base)
+    from ..discovery import discover_speakers, discovery_networks
+    networks = discovery_networks()
+    ips = discover_speakers(None)
     if not ips:
-        raise SystemExit(f"--speaker auto: no L15A speaker found on {base}.0/24")
+        raise SystemExit(f"--speaker auto: no L15A speaker found on {', '.join(networks)}")
     if len(ips) > 1:
         log(f"AUTO multiple speakers found {ips}; using {ips[0]}")
     else:
-        log(f"AUTO discovered speaker {ips[0]} on {base}.0/24")
+        log(f"AUTO discovered speaker {ips[0]} on {', '.join(networks)}")
     return ips[0]
 
 
