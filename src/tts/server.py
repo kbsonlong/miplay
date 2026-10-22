@@ -70,16 +70,24 @@ class Handler(BaseHTTPRequestHandler):
             from ..discovery import scan_lan, default_base
             base = default_base()
             found = scan_lan(base)
-            speakers = [d["ip"] for d in found if d["kind"] == "speaker"]
+            speakers = [d["ip"] for d in found
+                        if d["kind"] in ("speaker", "miplay-speaker")]
             if speakers:
                 previous = self.service.speaker_host
-                self.service.speaker_host = speakers[0]
-                if previous != speakers[0] and self.service.session:
-                    # Force a fresh bootstrap against the new target.
+                # Auto-select only the L15A-compatible profile for now;
+                # L16B is parsed/observed but its media path is not yet
+                # integrated into the production TTS service.
+                usable = [d["ip"] for d in found if d["kind"] == "speaker"]
+                if usable:
+                    self.service.speaker_host = usable[0]
+                if previous != self.service.speaker_host and self.service.session:
                     self.service.session.close()
                     self.service.session = None
-                log(f"HTTP /discover switched speaker {previous} -> {speakers[0]}")
+                log(f"HTTP /discover speaker candidates={speakers}, "
+                    f"usable={usable}, selected={self.service.speaker_host}")
             responders = [{"ip": d["ip"], "kind": d["kind"],
+                           "model": d.get("model"), "version": d.get("version"),
+                           "device_info": d.get("device_info", {}),
                            "raw_hex": d["raw"].hex()} for d in found]
             self._json(200, {"base": base, "speakers": speakers,
                              "all_responders": responders})

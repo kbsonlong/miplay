@@ -21,7 +21,11 @@ import queue
 import socket
 import struct
 import threading
+import time
 from typing import List, Optional
+
+from ..control.wire import frame, recv_frame, legacy_hmac
+from ..control.client import SOURCE_VERSION
 
 CONTROL_PORT = 8899
 _MAGIC = b"$"
@@ -63,17 +67,94 @@ def parse_miplay_frame(data: bytes):
 
 
 def classify(data: bytes) -> str:
-    """Classify a first-response frame: 'speaker' | 'miplay-like' | 'unknown'."""
+    """Classify a first-response frame.
+
+    ``speaker`` is the legacy L15A challenge shape.  ``miplay-candidate``
+    covers newer Xiaomi devices such as the observed L16B (12-digit
+    challenge); it still needs the optional DeviceInfo handshake before being
+    selected for a model-specific media path.  This avoids confusing the
+    local miplay-br bridge (14-digit challenge) with a physical speaker.
+    """
     parsed = parse_miplay_frame(data)
     if parsed is None:
         return "unknown"
     cmd, _seq, payload = parsed
-    if cmd == 0x0028 and len(payload) in (16, 17) and payload.isdigit():
-        # Exact L15A challenge format validated by the V14 bootstrap.
-        return "speaker"
-    if cmd == 0x0028:
-        return "miplay-like"  # answers MiPlay but not an L15A challenge
-    return "unknown"
+    if cmd != 0x0028:
+        return "unknown"
+    if len(payload) in (16, 17) and payload.isdigit():
+        return "speaker"       # L15A, V14-verified
+    if len(payload) in (12, 13) and payload.isdigit():
+        return "miplay-candidate"  # newer Xiaomi MiPlay family, e.g. L16B
+    if len(payload) == 14 and payload.isdigit():
+        return "miplay-like"   # observed local bridge, not a device
+    return "miplay-like"
+
+
+def parse_device_info(payload: bytes) -> dict:
+    """Extract printable key/value fields from the 0x001f DeviceInfo blob.
+
+    The payload is a compact binary serialization rather than JSON.  Keys and
+    values are length-prefixed, but unknown field types exist across firmware;
+    this deliberately extracts only printable ``key``/``value`` pairs and
+    preserves the raw payload for later protocol work.
+    """
+    text = payload.decode("latin1", errors="ignore")
+    fields = {}
+    known = ("accountId", "alonePlayCapacity", "audioLatencyMode",
+             "bluetoothMac", "canAlonePlayCtrl", "channel", "deviceId",
+             "deviceType", "groupId", "groupName", "house_Id", "isMaster",
+             "miName", "miotDid", "model", "serialNumber")
+    for key in known:
+        pos = text.find(key)
+        if pos < 0:
+            continue
+        tail = text[pos + len(key):]
+        # Observed scalar string encoding: 0x0c + BE uint16 length + bytes.
+        marker = tail.find("\x0c")
+        if marker >= 0 and marker + 3 <= len(tail):
+            n = int.from_bytes(tail[marker + 1:marker + 3].encode("latin1"), "big")
+            value = tail[marker + 3:marker + 3 + n]
+            if value and all(32 <= ord(ch) < 127 for ch in value):
+                fields[key] = value
+    return fields
+
+
+def probe_device_info(ip: str, port: int = CONTROL_PORT,
+                      timeout: float = 2.0) -> dict:
+    """Perform challenge/auth/GetDeviceInfo and return a model profile.
+
+    This is a protocol probe only: it stops after receiving 0x001f and never
+    sends SetPlaySource, Open, SetMediaInfo, or media.
+    """
+    result = {"ip": ip, "kind": "unknown", "model": None,
+              "device_info": {}, "version": None}
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            cmd, seq, challenge = recv_frame(s)
+            result["kind"] = classify(frame(cmd, seq, challenge))
+            if cmd != 0x0028 or not challenge.isdigit():
+                return result
+            s.sendall(frame(0x36, 0, SOURCE_VERSION))
+            s.sendall(frame(0x29, seq, legacy_hmac(challenge)))
+            s.sendall(frame(0x1e, 1))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                s.settimeout(max(.1, min(.5, deadline - time.monotonic())))
+                try:
+                    cmd, seq, payload = recv_frame(s)
+                except socket.timeout:
+                    continue
+                if cmd == 0x37 and seq == 0:
+                    result["version"] = payload.rstrip(b"\0").decode("ascii", errors="replace")
+                elif cmd == 0x1f and seq == 1:
+                    result["device_info"] = parse_device_info(payload)
+                    result["model"] = result["device_info"].get("model")
+                    return result
+    except (OSError, ValueError, EOFError):
+        return result
+    return result
+
 
 
 def _probe(ip: str, port: int, timeout: float, send_probe: bool):
@@ -120,9 +201,21 @@ def scan_lan(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
             try:
                 _ip, data = _probe(ip, port, timeout, send_probe=True)
                 if data:
+                    kind = classify(data)
+                    profile = {"ip": ip, "kind": kind,
+                               "raw": data[:32]}
+                    if kind == "miplay-candidate":
+                        # Confirm physical device and obtain model before
+                        # exposing it as a speaker; this rejects bridge-like
+                        # responders without DeviceInfo.
+                        info = probe_device_info(ip, port, max(timeout, 1.0))
+                        if info.get("device_info"):
+                            profile.update({"kind": "miplay-speaker",
+                                            "model": info.get("model"),
+                                            "version": info.get("version"),
+                                            "device_info": info.get("device_info")})
                     with lock:
-                        found.append({"ip": ip, "kind": classify(data),
-                                      "raw": data[:32]})
+                        found.append(profile)
             finally:
                 q.task_done()
 
@@ -145,9 +238,16 @@ def default_base() -> str:
 
 def discover_speakers(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
                       timeout: float = 0.5) -> List[str]:
-    """Return IPs of genuine L15A speakers found on the /24 segment."""
+    """Return only L15A IPs whose media path is currently verified."""
     return [d["ip"] for d in scan_lan(base_ip, port, timeout)
             if d["kind"] == "speaker"]
+
+
+def discover_miplay_devices(base_ip: str = "192.168.3", port: int = CONTROL_PORT,
+                            timeout: float = 0.5) -> List[dict]:
+    """Return L15A and model-confirmed newer MiPlay speaker profiles."""
+    return [d for d in scan_lan(base_ip, port, timeout)
+            if d["kind"] in ("speaker", "miplay-speaker")]
 
 
 def main() -> int:
@@ -158,13 +258,15 @@ def main() -> int:
     from ..common import log
     log(f"DISCOVERY scanning {a.base}.0/24 (excluding {', '.join(local_ips()) or 'localhost'})")
     found = scan_lan(a.base, timeout=a.timeout)
-    speakers = [d for d in found if d["kind"] == "speaker"]
+    speakers = [d for d in found if d["kind"] in ("speaker", "miplay-speaker")]
     for d in found:
-        log(f"DISCOVERY {d['ip']:>15}  {d['kind']:<12} {d['raw']!r}")
+        log(f"DISCOVERY {d['ip']:>15}  {d['kind']:<16} "
+            f"model={d.get('model', '-')!s:<8} {d['raw']!r}")
     if speakers:
-        log(f"DISCOVERY speakers: {', '.join(d['ip'] for d in speakers)}")
+        log("DISCOVERY MiPlay devices: " + ", ".join(
+            f"{d['ip']}({d.get('model') or 'L15A'}):{d['kind']}" for d in speakers))
     else:
-        log("DISCOVERY no L15A speaker found")
+        log("DISCOVERY no MiPlay speaker found")
     return 0 if speakers else 1
 
 

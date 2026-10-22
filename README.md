@@ -129,6 +129,8 @@ curl -s http://127.0.0.1:9901/discover
 
 发现原理：并发探测本网段 /24 的 TCP/8899，真 L15A 对新控制连接回 `$ 0x0028` + **16/17 位十进制挑战**（与 V14 bootstrap 校验一致）；其他应答者（如本机 `miplay-br` 桥接，14 位挑战）标记为 `miplay-like` 不误选，本机 IP 一律跳过。
 
+当前协议画像：L15A 16/17 位 challenge → `speaker`（媒体已验证）；L16B 等新 Xiaomi 设备 12/13 位 challenge → 继续执行 challenge/HMAC/version/GetDeviceInfo，成功后标记 `miplay-speaker` 并记录 model/version/device_info。`--speaker auto` 目前只选择 `speaker`（L15A），L16B 需要完成音频媒体实机验证后再纳入自动播放。
+
 ```bash
 # 启动（默认监听 0.0.0.0:9901，音箱 192.168.3.4，回连 IP 192.168.3.18）
 python3 -m src.tts.server --listen 0.0.0.0:9901 --speaker 192.168.3.4

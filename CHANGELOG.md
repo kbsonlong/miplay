@@ -59,3 +59,11 @@
 - 集成：`--speaker auto`（启动时发现并锁定，找不到则退出）+ `GET /discover`（运行时重扫并热切换 `speaker_host`，必要时废弃旧会话）。修复 `/discover` 响应 bytes 未序列化导致的空回复。
 - 实机端到端：auto 发现 `192.168.3.4` → 播报 `done`（145 帧）。
 - 新增 9 项测试（真实帧样本分类、扫描跳过本机/mock probe 不碰真网），全套 41 项通过。
+
+### 2026-10-22 L16B MiPlay 协议解析（192.168.3.113）
+
+- 新设备 `Xiaomi Sound` / model `L16B` / fw `1.80.2`，同时广播 `_airplay._tcp`、`_raop._tcp`（mDNS 名称 `Xiaomi Sound-9457.local:7000`），并开放 MiPlay TCP/8899。
+- L16B challenge 为 12/13 位十进制（不同于 L15A 的 16/17 位），但完整接受 L15A 的 challenge → HMAC-SHA1 → version → GetDeviceInfo → sourceName → account/status → playback refresh → heartbeat 流程。
+- L16B 返回版本 `2.1.4052010`，DeviceInfo 解析出 `miName=Xiaomi Sound`、`model=L16B`、`deviceType=4`、`channel=center`、设备 ID 等；只读 ACK 差异：L15A 的 `0x000e/0x001c` 在 L16B 返回 `0x000f/0x001d`。
+- 已实测 `SetPlaySource/Open`：L16B 建立反向 TCP #1/#2/#3，TimerService UDP 时钟同步成功，RTSP `OPTIONS → GET_PARAMETER → SETUP → PLAY → TIME_OFFSET` 全部完成，`rtsp_ready=True`；本次刻意未发送 SetMediaInfo/音频。
+- 发现器升级为 challenge 分类 + 物理设备 DeviceInfo 画像：`192.168.3.113` 标记 `miplay-speaker(model=L16B)`，`192.168.3.4` 标记已验证 `speaker(L15A)`；`--speaker auto` 仍只选 L15A，避免未经媒体验证自动切换。
